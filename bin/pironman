@@ -12,6 +12,10 @@
 ####
 ####   restart              restart pironman service
 ####
+####   status               show service status
+####
+####   log                  follow the service log
+####
 ####   -h,--help            help, show this help
 ####
 ####   -c,--check           show all configurations
@@ -19,17 +23,18 @@
 ####   -a,--auto            [ on ],enable auto-start at boot
 ####                        [ off ], disable auto-start at boot
 ####
-####   -u,--unit            [ C/F ], set the unit of temperature,
-####                        C or F (Celsius/Fahrenheit)
+####   -u,--unit            [ C/F ], set the unit of temperature shown on the
+####                        screen, C or F (Celsius/Fahrenheit).
+####                        The fan threshold stays in celsius.
 ####
 ####   -f,--fan             [ temp ], Temperature at which the fan switches on,
-####                        (default 50℃), in range (30 ~ 80)
+####                        in celsius (default 50), in range (30 ~ 80)
 ####
 ####   -al,--always_on      [on/true/off/false], whether the screen is always on,
 ####                        default False
 ####
 ####   -s,--staty_time      [time], screen display duration in second,
-####                        in second, default 30
+####                        in second, default 60
 ####
 ####   -re|--rgb_enable)    [on/true/off/false], whether enable rgb strip,
 ####
@@ -43,18 +48,24 @@
 ####   -rb,--rgb_speed      [speed], rgb blink speed (0 ~ 100, default 50)
 ####
 ####   -pwm,--rgb_pwm       [frequency], rgb signal frequency (400 ~ 1600, default 1000 kHz)
+####                        only used by the ws281x backend
 ####
 ####   -rp,--rgb_pin        [pin], rgb signal pin, could be [10 / spi/ SPI / 12 / pwm/ PWM] or
 ####                        [21 / pcm / PCM], default 10
 ####
+####   -bk,--rgb_backend    [auto/spi/ws281x], how the WS2812 signal is generated.
+####                        "spi" uses the kernel SPI driver on GPIO10 and needs
+####                        no extra library, "ws281x" needs the rpi-ws281x pip
+####                        package and is required for pin 12 and 21.
+####                        default auto
+####
 ####   -F,--foreground      run in foreground
 ####
-#!/bin/bash
 
 CONF=/opt/pironman/config.txt
 main='/opt/pironman/main.py'
-# echo $main
-# echo 'config file:'$CONF
+LOG=/opt/pironman/log
+SERVICE=pironman.service
 
 # print colors
 RED='\033[0;31m'
@@ -71,6 +82,9 @@ BACKUP_BOOT_CONFIG="/boot/config.txt"
 boot_config=""
 
 run_in_background=true
+# set when an option changed the configuration, so the service is only
+# restarted when there is something new to pick up
+config_changed=false
 
 # Check if user is root
 if [ $(id -u) -ne 0 ]; then
@@ -89,7 +103,6 @@ else
     echo -e "${RED}Warning: Cannot find boot configuration file${NC}"
 fi
 
-# echo "boot_config: ${boot_config}"
 ##################### ---- fuctions ---- #####################
 
 help() {
@@ -97,37 +110,59 @@ help() {
   sed -rn 's/^#### //; s/^####$//; T; p;' "$0"
 }
 
+# True when systemd is running and knows our unit, which is the normal
+# case after "sudo python3 install.py".
+have_service() {
+  [ -d /run/systemd/system ] || return 1
+  systemctl list-unit-files "${SERVICE}" >/dev/null 2>&1
+}
+
 start() {
-  if [ $run_in_background == true ]; then
-    echo "run in background"
-    python3 $main 1>/dev/null 2>>/opt/pironman/log &
-  else
+  if [ "$run_in_background" == false ]; then
     echo "run in foreground"
-    python3 $main
+    exec python3 "$main"
   fi
-  # sudo python3 $main 1>/dev/null 2>&1 &
-  if [ $? == '0' ];then
+  if have_service; then
+    systemctl start "${SERVICE}"
+  else
+    echo "run in background"
+    nohup python3 "$main" >/dev/null 2>>"$LOG" &
+  fi
+  if [ $? == '0' ]; then
     echo "pironman start succeed"
   else
     echo "pironman start failed"
-    echo $?
   fi
 }
 
 stop() {
   echo "stopping pironman"
-  # kill $(ps aux | grep $main | awk '{ print $2 }') >/dev/null 2>&1
-  pid=$(ps aux | grep $main | awk '{print $2}')
-  echo "pid="$pid
-  kill -15 $pid >/dev/null 2>&1 # send SIGTERM signal
-  python3 $main close_rgb 1>/dev/null 2>>/opt/pironman/log & # close rgb
-  sleep 0.1 # exit handler
+  if have_service; then
+    # main.py cleans up on SIGTERM: screen off, fan off, LEDs cleared
+    systemctl stop "${SERVICE}"
+  else
+    # match the script path exactly instead of the old
+    # "ps aux | grep $main | awk '{print $2}'", which also picked up the
+    # grep itself and any unrelated process whose command line contained
+    # the path, and then passed that whole list to kill
+    pkill -TERM -f "python3 ${main}" 2>/dev/null
+    for _ in $(seq 1 30); do
+      pgrep -f "python3 ${main}" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    # make sure the strip is dark even if the process was already gone
+    python3 "$main" close_rgb >/dev/null 2>>"$LOG"
+  fi
 }
 
 restart() {
   echo "restarting pironman"
-  stop
-  start
+  if have_service && [ "$run_in_background" == true ]; then
+    systemctl restart "${SERVICE}"
+  else
+    stop
+    start
+  fi
 }
 
 want_reboot() {
@@ -136,6 +171,19 @@ want_reboot() {
     echo "Rebooting now ..."
     reboot
   fi
+}
+
+# set "key = value" in an ini style config file, appending it under [all]
+# when the key is not there yet
+set_conf() {
+  # $1: key, $2: value, $3: file
+  if grep -qE "^[[:space:]]*#?[[:space:]]*$1[[:space:]]*=" "$3"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*$1[[:space:]]*=.*|$1 = $2|" "$3"
+  else
+    grep -q '^\[all\]' "$3" || echo '[all]' >>"$3"
+    echo "$1 = $2" >>"$3"
+  fi
+  config_changed=true
 }
 
 change_config() {
@@ -160,6 +208,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     start)
       shift
+      # remaining options may still turn up (e.g. -F), handle at the end
+      if [[ $# -eq 0 ]]; then
+        start
+        exit 0
+      fi
       ;;
     stop)
       stop
@@ -167,6 +220,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     restart)
       restart
+      exit 0
+      ;;
+    status)
+      if have_service; then
+        systemctl status "${SERVICE}" --no-pager
+      else
+        pgrep -af "python3 ${main}" || echo "pironman is not running"
+      fi
+      exit 0
+      ;;
+    log)
+      if have_service; then
+        journalctl -u "${SERVICE}" -f -n 50
+      else
+        tail -f "$LOG"
+      fi
       exit 0
       ;;
     -h|--help)
@@ -182,12 +251,12 @@ while [[ $# -gt 0 ]]; do
       case "$2" in
         "on"|true)
           echo "enable auto-start at boot"
-          systemctl enable pironman.service
+          systemctl enable "${SERVICE}"
           shift 2
           ;;
         "off"|false)
           echo "disable auto-start at boot"
-          systemctl disable pironman.service
+          systemctl disable "${SERVICE}"
           shift 2
         ;;
         *)
@@ -198,13 +267,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     -u|--unit)
       if [ $# -lt 2 ] ;then
-        echo "usage: pironman -c|--check [C/F]"
+        echo "usage: pironman -u|--unit [C/F]"
         exit 1
       else
-        if [ $2 == 'C' ] || [ $2 == 'F' ];then
-          sed -i "s/^unit=.*/unit=$2/" $CONF
-          sed -i -e "s:temp_unit.*=.*:temp_unit = $2:g" ${CONF}
-          echo "set temperature unit to "$2
+        if [ "$2" == 'C' ] || [ "$2" == 'F' ];then
+          set_conf temp_unit "$2" "${CONF}"
+          echo "set temperature unit to $2"
           shift 2
         else
           echo "unit must be C or F"
@@ -218,9 +286,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       else
         if [[ $2 =~ ^[[:digit:]]+$ ]]; then
-          echo "set the fan on temperature to $2 "
-          sed -i -e "s:fan_temp.*=.*:fan_temp = $2:g" ${CONF}
-          shift 2
+          if [ "$2" -ge 30 ] && [ "$2" -le 80 ]; then
+            echo "set the fan on temperature to $2 "
+            set_conf fan_temp "$2" "${CONF}"
+            shift 2
+          else
+            echo "out of range (30 ~ 80) "
+            exit 1
+          fi
         else
           echo "parameter must be integer"
           exit 1
@@ -231,12 +304,12 @@ while [[ $# -gt 0 ]]; do
       case "$2" in
         "on"|true)
           echo "set screen_always_on to on "
-          sed -i -e "s:screen_always_on.*=.*:screen_always_on = True:g" ${CONF}
+          set_conf screen_always_on True "${CONF}"
           shift 2
         ;;
         "off"|false)
           echo "set screen_always_on to off "
-          sed -i -e "s:screen_always_on.*=.*:screen_always_on = False:g" ${CONF}
+          set_conf screen_always_on False "${CONF}"
           shift 2
         ;;
         *)
@@ -251,7 +324,7 @@ while [[ $# -gt 0 ]]; do
       else
         if [[ $2 =~ ^[[:digit:]]+$ ]]; then
           echo "set screen_off_time to $2 "
-          sed -i -e "s:screen_off_time.*=.*:screen_off_time = $2:g" ${CONF}
+          set_conf screen_off_time "$2" "${CONF}"
           shift 2
         else
           echo "parameter must be integer"
@@ -263,12 +336,12 @@ while [[ $# -gt 0 ]]; do
       case "$2" in
         "on"|true)
           echo "set rgb_enable to on "
-          sed -i -e "s:rgb_enable.*=.*:rgb_enable = True:g" ${CONF}
+          set_conf rgb_enable True "${CONF}"
           shift 2
         ;;
         "off"|false)
           echo "set rgb_enable to off "
-          sed -i -e "s:rgb_enable.*=.*:rgb_enable = False:g" ${CONF}
+          set_conf rgb_enable False "${CONF}"
           shift 2
         ;;
         *)
@@ -281,7 +354,7 @@ while [[ $# -gt 0 ]]; do
       case "$2" in
         breath|static|leap|flow|raise_up|colorful|colorful_static|colorful_leap)
           echo "set rgb_style to $2 "
-          sed -i -e "s:rgb_style.*=.*:rgb_style = $2:g" ${CONF}
+          set_conf rgb_style "$2" "${CONF}"
           shift 2
         ;;
         *)
@@ -295,9 +368,14 @@ while [[ $# -gt 0 ]]; do
         echo "usage: pironman -rc|--rgb_color [color],clolor in HEX. eg: 0a1aff"
         exit 1
       else
-        echo "set rgb_color to $2 "
-        sed -i -e "s:rgb_color.*=.*:rgb_color = $2:g" ${CONF}
-        shift 2
+        if [[ $2 =~ ^#?[0-9a-fA-F]{6}$ ]]; then
+          echo "set rgb_color to $2 "
+          set_conf rgb_color "${2#\#}" "${CONF}"
+          shift 2
+        else
+          echo "color must be 6 hex digits, eg: 0a1aff"
+          exit 1
+        fi
       fi
       ;;
     -rb|--rgb_speed)
@@ -308,7 +386,7 @@ while [[ $# -gt 0 ]]; do
         if [[ $2 =~ ^[[:digit:]]+$ ]]; then
           if [ $2 -ge 0 ] && [ $2 -le 100 ]; then
             echo "set rgb_blink_speed to $2 "
-            sed -i -e "s:rgb_blink_speed.*=.*:rgb_blink_speed = $2:g" ${CONF}
+            set_conf rgb_blink_speed "$2" "${CONF}"
             shift 2
           else
             echo "out of range (0 ~ 100) "
@@ -330,7 +408,7 @@ while [[ $# -gt 0 ]]; do
           if [ $2 -ge 400 ] && [ $2 -le 1600 ];
           then
             echo "set rgb_pwm_freq to $2 "
-            sed -i -e "s:rgb_pwm_freq.*=.*:rgb_pwm_freq = $2:g" ${CONF}
+            set_conf rgb_pwm_freq "$2" "${CONF}"
             shift 2
           else
             echo "out of range (400 ~ 1600) kHz "
@@ -342,12 +420,25 @@ while [[ $# -gt 0 ]]; do
         fi
       fi
       ;;
+    -bk|--rgb_backend)
+      case "$2" in
+        auto|spi|ws281x)
+          echo "set rgb_backend to $2 "
+          set_conf rgb_backend "$2" "${CONF}"
+          shift 2
+          ;;
+        *)
+          echo "usage: pironman -bk|--rgb_backend [auto/spi/ws281x]"
+          exit 1
+          ;;
+      esac
+      ;;
     -rp|--rgb_pin)
       case "$2" in
         spi|SPI|10)
           echo "set rgb io to pin 10 (spi)"
           # set pin
-          change_config ".*rgb_pin\s*=.*"  "rgb_pin = 10" ${CONF}
+          set_conf rgb_pin 10 "${CONF}"
           #
           if [[ $boot_config != "" ]]; then
             echo "boot_config: ${boot_config}"
@@ -367,7 +458,13 @@ while [[ $# -gt 0 ]]; do
         pwm|PWM|12)
           echo "set rgb io to pin 12 (pwm)"
           # set io
-          change_config ".*rgb_pin\s*=.*"  "rgb_pin = 12" ${CONF}
+          set_conf rgb_pin 12 "${CONF}"
+          # the SPI backend can only drive GPIO10, pin 12 needs rpi_ws281x
+          set_conf rgb_backend ws281x "${CONF}"
+          if ! python3 -c "import rpi_ws281x" 2>/dev/null; then
+            echo -e "${YELLOW}Warning: the rpi-ws281x package is missing, pin 12 will not work."
+            echo -e "Install it with: sudo python3 install.py --with-ws281x${NC}"
+          fi
           #
           if [[ $boot_config != "" ]]; then
             echo "boot_config: ${boot_config}"
@@ -382,7 +479,13 @@ while [[ $# -gt 0 ]]; do
         pcm|PCM|21)
           echo "set rgb io to pin 21 (pcm)"
           # set io
-          change_config ".*rgb_pin\s*=.*"  "rgb_pin = 21" ${CONF}
+          set_conf rgb_pin 21 "${CONF}"
+          # the SPI backend can only drive GPIO10, pin 21 needs rpi_ws281x
+          set_conf rgb_backend ws281x "${CONF}"
+          if ! python3 -c "import rpi_ws281x" 2>/dev/null; then
+            echo -e "${YELLOW}Warning: the rpi-ws281x package is missing, pin 21 will not work."
+            echo -e "Install it with: sudo python3 install.py --with-ws281x${NC}"
+          fi
           #
           if [[ $boot_config != "" ]]; then
             echo "boot_config: ${boot_config}"
@@ -414,4 +517,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-restart
+if [ "$run_in_background" == false ]; then
+  start
+else
+  restart
+fi

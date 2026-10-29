@@ -1,9 +1,17 @@
 [all]
-# power_key_pin, gpio pin to power key,default pin 26 (BCM)
+# power_key_pin, gpio pin to power key, default pin 16 (BCM)
+#
+# power_key_pull, internal pull resistor on the power key pin,
+#                 [ down / up / none ], default down.
+#                 The board has its own pull-up, so "down" is correct for
+#                 the stock Pironman; change it only if the key reads as
+#                 permanently pressed.
 #
 # fan_gpio, gpio pin to switch fan, default pin 6 (BCM)
 #
-# temp_unit, the unit of temperature, [ C / F ] (Celsius/Fahrenheit)
+# temp_unit, the unit of temperature shown on the screen,
+#            [ C / F ] (Celsius/Fahrenheit).
+#            fan_temp below always stays in celsius.
 #
 # fan_temp, temperature at which the fan switches on,
 #           in celsius (default 50),in range (30 ~ 80)
@@ -20,11 +28,22 @@
 #
 # rgb_blink_speed, rgb color change speed (0 ~ 100, default 50)
 #
-# rgb_pwm_freq, rgb signal frequency (400 ~ 1600, default 1000 kHz)
+# rgb_pwm_freq, rgb signal frequency (400 ~ 1600, default 1000 kHz),
+#               only used by the ws281x backend
 #
 # rgb_pin, rgb signal pin, could be 10(spi), 12(PWM) or 21(PCM)
 #
+# rgb_backend, how the WS2812 signal is generated:
+#              spi     - kernel SPI driver on GPIO10, needs only
+#                        python3-spidev and runs on any kernel
+#              ws281x  - the rpi-ws281x C library, required for pin 12
+#                        and 21, has to be built with pip
+#              auto    - spi on pin 10, ws281x otherwise (default)
+#
 
+power_key_pin = 16
+power_key_pull = down
+fan_pin = 6
 temp_unit = C
 fan_temp = 50
 screen_always_on = False
@@ -35,3 +54,4 @@ rgb_color = 0a1aff
 rgb_blink_speed = 50
 rgb_pwm_freq = 1000
 rgb_pin = 10
+rgb_backend = auto

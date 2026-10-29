@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import time
 import threading
@@ -12,61 +13,69 @@ if os.geteuid() != 0:
     sys.exit(1)
 
 errors = []
+warnings = []
 
 avaiable_options = [
     '-h', '--help', '--no-dep', '--skip-config-txt', '--skip-auto-startup',
-    '--skip-reboot'
+    '--skip-reboot', '--with-ws281x'
 ]
 
 usage = '''
 Usage:
-    python3 install.py [option]
+    sudo python3 install.py [option]
 
 Options:
                --no-dep             Do not download dependencies
-               --skip-config-txt    Skip config /boot/config.txt
+               --skip-config-txt    Skip config /boot/firmware/config.txt
                --skip-auto-startup  Skip enable auto startup
                --skip-reboot        Skip reboot after install
+               --with-ws281x        Also build the rpi-ws281x library. Only
+                                    needed to drive the LED strip from the
+                                    PWM (GPIO12) or PCM (GPIO21) pin; the
+                                    default SPI pin (GPIO10) does not use it.
     -h         --help               Show this help text and exit
 '''
 
+# Everything comes from apt. On Debian trixie /usr is marked
+# EXTERNALLY-MANAGED (PEP 668), so "pip3 install" either refuses to run or
+# has to be forced with --break-system-packages, which then shadows the
+# distribution packages. All runtime dependencies exist as .deb, so pip is
+# no longer used for them:
+#   python3-pil       was built from source via pip ("pillow --no-cache-dir"),
+#                     which needed libtiff5-dev, libfreetype6-dev and friends
+#   python3-smbus2    pure python I2C, lets the OLED frame go out in one
+#                     transaction
+#   python3-spidev    drives the WS2812 strip on GPIO10 without rpi-ws281x
+#   python3-lgpio     backend gpiozero uses on kernel 6.6 and later
+# The old list also pulled in libfreetype6-dev, which no longer exists in
+# trixie (it is libfreetype-dev now), so "apt install" failed there.
 APT_INSTALL_LIST = [
-    # 'libraspberrypi-bin',
-    # 'raspi-config', # http://archive.raspberrypi.org/debian/pool/main/r/raspi-config/
-    'net-tools',
-    'python3-smbus',
     'i2c-tools',
-    'libtiff5-dev',  # https://pillow.readthedocs.io/en/latest/installation.html
-    'libopenjp2-7-dev',
-    'zlib1g-dev',
-    'libfreetype6-dev',
-    'libpng-dev',
-    'libxcb1-dev',
-    'build-essential',  # arm-linux-gnueabihf-gcc for pip building
-    'python3-dev',  # for rpi-ws281x pip building
+    'python3-smbus',
+    'python3-smbus2',
+    'python3-spidev',
+    'python3-pil',
+    'python3-psutil',
+    'python3-requests',
     'python3-gpiozero',
+    'python3-lgpio',
 ]
 
-PIP_INSTALL_LIST = [
+# only for --with-ws281x
+APT_WS281X_LIST = [
+    'build-essential',
+    'python3-dev',
+]
+PIP_WS281X_LIST = [
     'rpi-ws281x',
-    # 'pillow --no-binary :all:', # https://pillow.readthedocs.io/en/latest/installation.html
-    'pillow --no-cache-dir',
-    'requests',
-    'psutil',
 ]
 
 
 def run_command(cmd=""):
     import subprocess
-    p = subprocess.Popen(cmd,
-                         shell=True,
-                         stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT,
-                         universal_newlines=True)
-    p.wait()
-    result = p.stdout.read()
-    status = p.poll()
-    return status, result
+    p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True)
+    return p.returncode, p.stdout
 
 
 at_work_tip_sw = False
@@ -88,7 +97,7 @@ def working_tip():
     sys.stdout.flush()
 
 
-def do(msg="", cmd=""):
+def do(msg="", cmd="", fatal=True):
     print(" - %s... " % (msg), end='', flush=True)
     # at_work_tip start
     global at_work_tip_sw
@@ -98,7 +107,6 @@ def do(msg="", cmd=""):
     _thread.start()
     # process run
     status, result = run_command(cmd)
-    # print(status, result)
     # at_work_tip stop
     at_work_tip_sw = False
     while _thread.is_alive():
@@ -106,23 +114,41 @@ def do(msg="", cmd=""):
     # status
     if status == 0:
         print('Done')
-    else:
+    elif fatal:
         print('\033[1;35mError\033[0m')
         errors.append("%s error:\n  Status:%s\n  Error:%s" %
                       (msg, status, result))
+    else:
+        print('\033[1;33mSkipped\033[0m')
+        warnings.append("%s skipped:\n  Status:%s\n  Output:%s" %
+                        (msg, status, result))
+    return status
 
 
-def set_config(msg="", name="", value=""):
+def set_config(msg="", name="", value="", config=None):
     print(" - %s... " % (msg), end='', flush=True)
     try:
-        Config().set(name, value)
+        (config or Config()).set(name, value)
         print('Done')
     except Exception as e:
         print('\033[1;35mError\033[0m')
         errors.append("%s error:\n Error:%s" % (msg, e))
 
 
+SECTION_RE = re.compile(r'^\[[^\]]+\]$')
+
+
 class Config(object):
+    '''
+    Minimal editor for the Raspberry Pi boot config.
+
+    The 2.2.9 version matched keys with "name in config", a plain substring
+    test over the whole file. That had two consequences: setting
+    "core_freq" could hit an existing "core_freq_min" line and destroy it,
+    and a key inside a conditional block such as [pi5] or [cm4] could be
+    rewritten even though it does not apply to this board. Keys are now
+    matched as whole assignments and only inside the target section.
+    '''
     DEFAULT_FILE = "/boot/firmware/config.txt"
     BACKUP_FILE = "/boot/config.txt"
 
@@ -145,35 +171,92 @@ class Config(object):
         with open(self.file, 'r') as f:
             self.configs = f.read()
         self.configs = self.configs.split('\n')
+        self._backed_up = False
+
+    def _backup(self):
+        '''Keep one copy of the untouched file next to the original.'''
+        if self._backed_up:
+            return
+        backup = self.file + '.pironman-bak'
+        if not os.path.exists(backup):
+            with open(backup, 'w') as f:
+                f.write('\n'.join(self.configs))
+        self._backed_up = True
+
+    def _section_of(self, index):
+        '''
+        Which conditional block line `index` belongs to.
+
+        Lines before the first [filter] apply to every board, so they count
+        as "[all]".
+        '''
+        section = '[all]'
+        for i in range(index):
+            stripped = self.configs[i].strip()
+            if SECTION_RE.match(stripped):
+                section = stripped
+        return section
+
+    @staticmethod
+    def _is_entry(line, name):
+        '''True when line assigns exactly `name` (commented out or not).'''
+        bare = line.strip().lstrip('#').strip()
+        return bare == name or bare.startswith(name + '=')
 
     def remove(self, expected):
-        for config in self.configs:
-            if expected in config:
-                self.configs.remove(config)
+        # build a new list instead of removing from the list being iterated
+        self._backup()
+        self.configs = [c for c in self.configs if expected not in c]
         return self.write_file()
 
     def set(self, name, value=None, device="[all]"):
         '''
         device : "[all]", "[pi3]", "[pi4]" or other
         '''
-        have_excepted = False
-        for i in range(len(self.configs)):
-            config = self.configs[i]
-            if name in config:
-                have_excepted = True
-                tmp = name
-                if value != None:
-                    tmp += '=' + value
-                self.configs[i] = tmp
+        self._backup()
+        entry = name if value is None else f'{name}={value}'
+
+        active = None     # an uncommented assignment we can update
+        commented = None  # a commented out one we can revive
+        for i, line in enumerate(self.configs):
+            if SECTION_RE.match(line.strip()):
+                continue
+            if not self._is_entry(line, name):
+                continue
+            if self._section_of(i) != device:
+                continue
+            if line.strip().startswith('#'):
+                if commented is None:
+                    commented = i
+            else:
+                active = i
                 break
 
-        if not have_excepted:
-            self.configs.append(device)
-            tmp = name
-            if value != None:
-                tmp += '=' + value
-            self.configs.append(tmp)
+        if active is not None:
+            self.configs[active] = entry
+        elif commented is not None:
+            self.configs[commented] = entry
+        else:
+            # append at the end, opening the section only when the file does
+            # not already end inside it, so repeated installs do not stack up
+            # [all] headers
+            while self.configs and self.configs[-1].strip() == '':
+                self.configs.pop()
+            if self._section_of(len(self.configs)) != device:
+                self.configs.append(device)
+            self.configs.append(entry)
+            self.configs.append('')
         return self.write_file()
+
+    def get(self, name, device="[all]"):
+        for i, line in enumerate(self.configs):
+            if SECTION_RE.match(line.strip()):
+                continue
+            if line.strip().startswith('#'):
+                continue
+            if self._is_entry(line, name) and self._section_of(i) == device:
+                return line.strip()
+        return None
 
     def write_file(self):
         try:
@@ -195,7 +278,8 @@ def install():
     if status == 0:
         print(f"Kernel Version:\n{result}")
     # print OS Version
-    status, result = run_command("lsb_release -a|grep Description")
+    status, result = run_command(
+        ". /etc/os-release && echo \"$PRETTY_NAME\"")
     if status == 0:
         print(f"OS Version:\n{result}")
     # print PCB information
@@ -218,70 +302,57 @@ def install():
     #
     if "--no-dep" not in options:
         # update apt
-        do(msg="update apt", cmd='apt update -y')
-        # check whether pip has the option "--break-system-packages"
-        _is_bsps = ''
-        status, _ = run_command("pip3 help install|grep break-system-packages")
-        if status == 0:  # if true
-            _is_bsps = "--break-system-packages"
-            print("pip3 install need --break-system-packages")
-        # update pip
-        do(msg="update pip3",
-           cmd=f'python3 -m pip install --upgrade pip {_is_bsps}')
-        ##
-        print("Install dependencies with apt-get")
-        do(msg="apt --fix-broken", cmd="apt --fix-broken install -y")
-        # # check & install raspi-config
-        # _status, _ = run_command("raspi-config nonint")
-        # if _status != 0:
-        #     _link = "http://archive.raspberrypi.org/debian/pool/main/r/raspi-config/"
-        #     _cmd = f"curl -s '{_link}' | grep -o '\"raspi-config.*.deb\"' |sort |tail -1"
-        #     _,_last_version = run_command(_cmd)
-        #     _last_version = _last_version.replace('\n', '').replace('\r', '').replace('"', ' ').strip()
-        #     _link = _link + _last_version
-
-        #     do(msg="install raspi-config",
-        #         cmd="apt install lua5.1 alsa-utils triggerhappy curl -y"
-        #         +f" && wget -N {_link}"
-        #         +f" && dpkg -i {_last_version}"
-        #         +"&& apt --fix-broken install -y"
-        #     )
-        #
+        do(msg="update apt", cmd='apt-get update')
+        print("Install dependencies with apt")
+        do(msg="apt --fix-broken", cmd="apt-get --fix-broken install -y")
         for dep in APT_INSTALL_LIST:
-            do(msg="install %s" % dep, cmd='apt install %s -y' % dep)
-
-        print("Install dependencies with pip3")
-        for dep in PIP_INSTALL_LIST:
-            do(msg="install %s" % dep, cmd=f'pip3 install {dep} {_is_bsps}')
+            do(msg="install %s" % dep, cmd='apt-get install %s -y' % dep)
+        #
+        if "--with-ws281x" in options:
+            print("Install the rpi-ws281x library (PWM/PCM pin support)")
+            for dep in APT_WS281X_LIST:
+                do(msg="install %s" % dep, cmd='apt-get install %s -y' % dep)
+            # rpi-ws281x has no .deb, so this one really does need pip and
+            # has to opt out of the PEP 668 guard on /usr
+            for dep in PIP_WS281X_LIST:
+                do(msg="install %s" % dep,
+                   cmd=f'pip3 install {dep} --break-system-packages',
+                   fatal=False)
     #
     print("Config gpio")
     #
     if "--skip-config-txt" not in options:
-        _status, _ = run_command("raspi-config nonint")
+        # raspi-config is the supported way to flip these and also creates
+        # the /dev nodes right away where possible
+        _status, _ = run_command("which raspi-config")
         if _status == 0:
             do(msg="enable i2c ", cmd='raspi-config nonint do_i2c 0')
             do(msg="enable spi ", cmd='raspi-config nonint do_spi 0')
         #
+        config = Config()
+        print(f" - boot config: {config.file}")
         set_config(msg="enable i2c in config",
                    name="dtparam=i2c_arm",
-                   value="on")
-        set_config(msg="enable spi in config", name="dtparam=spi", value="on")
-        # set_config(msg="disable audio",
-        #     name="dtparam=audio",
-        #     value="off"
-        # )
-        set_config(msg="set core_freq to 500", name="core_freq", value="500")
+                   value="on", config=config)
+        set_config(msg="enable spi in config", name="dtparam=spi", value="on",
+                   config=config)
+        # The SPI clock on the Pi 4 is derived from the GPU core clock, so
+        # pinning it keeps the WS2812 bit timing inside spec. Without
+        # core_freq_min the core drops to 200 MHz when idle and the strip
+        # shows wrong colours.
+        set_config(msg="set core_freq to 500", name="core_freq", value="500",
+                   config=config)
         set_config(msg="set core_freq_min to 500",
                    name="core_freq_min",
-                   value="500")
+                   value="500", config=config)
         # dtoverlay=gpio-poweroff,gpio_pin=26,active_low=0
         set_config(msg="config gpio-poweroff",
                    name="dtoverlay=gpio-poweroff,gpio_pin",
-                   value="26,active_low=0")
+                   value="26,active_low=0", config=config)
         # dtoverlay=gpio-ir,gpio_pin=13
         set_config(msg="config gpio-ir",
                    name="dtoverlay=gpio-ir,gpio_pin",
-                   value="13")
+                   value="13", config=config)
     #
     print('create WorkingDirectory')
     do(msg="create dir",
@@ -290,20 +361,34 @@ def install():
        (username, username, __app_name__))
     #
     if "--skip-auto-startup" not in options:
+        # /etc/systemd/system is the place for locally installed units;
+        # /usr/lib/systemd/system (used up to 2.2.9) belongs to .deb packages
+        # and is wiped by distribution upgrades
         do(msg='copy service file',
-           cmd='cp -rpf ./bin/%s.service /usr/lib/systemd/system/%s.service ' %
-           (__app_name__, __app_name__))
-        do(msg="add excutable mode for service file",
-           cmd='chmod +x /usr/lib/systemd/system/%s.service' % __app_name__)
+           cmd='cp -rpf ./bin/%s.service /etc/systemd/system/%s.service' %
+           (__app_name__, __app_name__) +
+           ' && chmod 644 /etc/systemd/system/%s.service' % __app_name__)
+        # remove the unit a 2.2.x install left in the package directory,
+        # otherwise two units with the same name shadow each other
+        do(msg='remove legacy service file',
+           cmd='rm -f /usr/lib/systemd/system/%s.service' % __app_name__)
+    # the repository ships an empty "log" placeholder, keep the installed
+    # log file instead of truncating it on every upgrade
     do(msg='copy bin file',
        cmd='cp -rpf ./bin/%s /usr/local/bin/%s' %
-       (__app_name__, __app_name__) + ' && cp -rpf ./%s/* /opt/%s/' %
-       (__app_name__, __app_name__))
+       (__app_name__, __app_name__) +
+       r" && find ./%s -maxdepth 1 -type f ! -name log -exec cp -pf {} /opt/%s/ \;"
+       % (__app_name__, __app_name__) +
+       ' && touch /opt/%s/log' % __app_name__)
     do(msg="add excutable mode for bin file",
        cmd='chmod +x /usr/local/bin/%s' % __app_name__ +
        ' && chmod -R 774 /opt/%s' % __app_name__ +
        ' && chown -R %s:%s /opt/%s' % (username, username, __app_name__))
-    do(msg='copy config file', cmd=f'cp -rpf ./config.txt {config_file}')
+    # never clobber a config the user has already tuned
+    if os.path.exists(config_file):
+        print(f" - keep existing config file {config_file}... Done")
+    else:
+        do(msg='copy config file', cmd=f'cp -rpf ./config.txt {config_file}')
     #
     if "--skip-auto-startup" not in options:
         do(msg='enable the service to auto-start at boot',
@@ -311,6 +396,11 @@ def install():
            f' && systemctl enable {__app_name__}.service')
     #
     do(msg='run the service', cmd='pironman restart')
+
+    if warnings:
+        print('\n\033[1;33mSome optional steps were skipped:\033[0m')
+        for warning in warnings:
+            print(warning)
 
     if len(errors) == 0:
         print("Finished.")

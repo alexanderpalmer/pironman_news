@@ -1,5 +1,65 @@
-from smbus import SMBus
+import os
+import re
 from time import sleep
+
+from utils import log, run_command
+
+# smbus2 is pure python, actively maintained and ships with Debian trixie
+# (python3-smbus2). It also exposes i2c_msg, which lets the OLED buffer go
+# out in a single transaction instead of 64 block writes. The classic
+# python3-smbus binding stays as a fallback.
+try:
+    from smbus2 import SMBus, i2c_msg
+    _HAVE_I2C_MSG = True
+except ImportError:
+    from smbus import SMBus
+    i2c_msg = None
+    _HAVE_I2C_MSG = False
+
+# On the Pi 4 the buses numbered 20 and 21 are the HDMI DDC channels, they
+# never carry the Pironman OLED. /dev/i2c-1 is the GPIO2/GPIO3 header bus
+# that "dtparam=i2c_arm=on" creates.
+PREFERRED_BUSES = (1, 0)
+IGNORED_BUSES = (20, 21, 22)
+
+
+def available_buses():
+    '''Numbers of all /dev/i2c-* buses that can carry header devices.'''
+    buses = []
+    try:
+        for name in os.listdir('/dev'):
+            m = re.fullmatch(r'i2c-(\d+)', name)
+            if m:
+                num = int(m.group(1))
+                if num not in IGNORED_BUSES:
+                    buses.append(num)
+    except OSError:
+        pass
+    return sorted(buses)
+
+
+def pick_bus():
+    '''
+    Choose the I2C bus to talk to the OLED on.
+
+    Raises a FileNotFoundError with an actionable message when the ARM I2C
+    bus is missing, which is the normal state of a fresh Debian trixie
+    image: "dtparam=i2c_arm=on" is commented out in /boot/firmware/config.txt
+    so only the HDMI buses exist.
+    '''
+    env = os.environ.get('PIRONMAN_I2C_BUS')
+    if env:
+        return int(env)
+    buses = available_buses()
+    for num in PREFERRED_BUSES:
+        if num in buses:
+            return num
+    if buses:
+        return buses[0]
+    raise FileNotFoundError(
+        "no usable /dev/i2c-* bus found. Enable I2C with "
+        "'sudo raspi-config nonint do_i2c 0' or add 'dtparam=i2c_arm=on' to "
+        "/boot/firmware/config.txt and reboot.")
 
 
 class I2C():
@@ -7,10 +67,21 @@ class I2C():
     SLAVE  = 1
     RETRY = 5
 
-    def __init__(self, *args, **kargs):     
+    def __init__(self, bus=None, *args, **kargs):
         super().__init__()
-        self._bus = 1
+        self._bus = pick_bus() if bus is None else bus
         self._smbus = SMBus(self._bus)
+        log(f'i2c bus: {self._bus} (smbus2: {_HAVE_I2C_MSG})')
+
+    @property
+    def bus(self):
+        return self._bus
+
+    def close(self):
+        try:
+            self._smbus.close()
+        except Exception:
+            pass
 
     def _i2c_write_byte(self, addr, data):                      # i2C write function
         return self._smbus.write_byte(addr, data)
@@ -23,6 +94,23 @@ class I2C():
 
     def _i2c_write_i2c_block_data(self, addr, reg, data):
         return self._smbus.write_i2c_block_data(addr, reg, data)
+
+    def write_block_large(self, addr, reg, data):
+        '''
+        Write reg followed by an arbitrary amount of data.
+
+        With smbus2 this is one I2C_RDWR transaction, which is what makes a
+        full 1024 byte OLED frame cheap. Without it the caller has to fall
+        back to chunked write_i2c_block_data() calls.
+        '''
+        if not _HAVE_I2C_MSG:
+            raise NotImplementedError('smbus2 required for large block writes')
+        msg = i2c_msg.write(addr, bytes([reg]) + bytes(data))
+        self._smbus.i2c_rdwr(msg)
+
+    @property
+    def has_large_block_write(self):
+        return _HAVE_I2C_MSG
 
     def _i2c_read_byte(self, addr):                             # i2C read functions
         return self._smbus.read_byte(addr)
@@ -37,20 +125,21 @@ class I2C():
         else:
             return False
 
-    def scan(self):                                             # scan available i2c devices
-        cmd = "i2cdetect -y %s" % self._bus
-        _, output = self.run_command(cmd)                       # run linux command and return the output of it
+    def scan(self):
+        '''
+        Scan the bus for devices.
 
-        outputs = output.split('\n')[1:]                        
+        Probing is done with smbus itself instead of parsing i2cdetect
+        output, so the scan no longer depends on i2c-tools being installed
+        or on its output format and locale.
+        '''
         addresses = []
-        for tmp_addresses in outputs:
-            if tmp_addresses == "":
+        for addr in range(0x03, 0x78):
+            try:
+                self._smbus.write_quick(addr)
+                addresses.append(addr)
+            except OSError:
                 continue
-            tmp_addresses = tmp_addresses.split(':')[1]
-            tmp_addresses = tmp_addresses.strip().split(' ')    # remove leading & trailing space, then split by space 
-            for address in tmp_addresses:
-                if address != '--':
-                    addresses.append(int(address, 16))
         return addresses
 
     def send(self, send, addr, timeout=0):                      # sending data. `send`: data to be sent, `addr`: receiver's address 
@@ -133,4 +222,3 @@ class I2C():
 
     def writeto_mem(self, addr, memaddr, data):
         self.mem_write(data, addr, memaddr)
-

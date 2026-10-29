@@ -1,14 +1,31 @@
 # https://www.freedesktop.org/software/systemd/man/systemd.service.html
 [Unit]
-Description=pironman service
-After=multi-user.target # Need to start last to avoid gpio being occupied
+Description=Pironman case service (OLED, fan, RGB strip)
+Documentation=https://github.com/sunfounder/pironman
+# Start late so the GPIO lines are not claimed before the system is up.
+# systemd does not accept a trailing comment on a value line: up to 2.2.9
+# this read "After=multi-user.target # Need to start last ...", and the
+# words of the comment were parsed as further unit names.
+After=multi-user.target
 
 [Service]
-Type=forking
+# Type=simple and running main.py directly lets systemd track the real
+# process. Up to 2.2.9 this was Type=forking around a shell script that
+# backgrounded python with "&", so systemd never knew the actual PID and
+# could neither stop nor restart the service reliably.
+Type=simple
 WorkingDirectory=/opt/pironman
-ExecStart=/usr/local/bin/pironman start
-#ExecStop=/usr/local/bin/pironman stop
-PrivateTmp=True
+# Without this python block-buffers stdout, because journald is a pipe and
+# not a terminal, and the log lines only reach the journal when the process
+# exits -- "pironman log" showed nothing while the service was running.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/pironman/main.py
+# main.py handles SIGTERM and switches the panel, the fan and the LEDs off
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

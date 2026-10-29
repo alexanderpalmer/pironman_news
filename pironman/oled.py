@@ -152,6 +152,11 @@ class SSD1306Base(object):
     def off(self):
         self.write_command(SSD1306_DISPLAYOFF)
 
+    def close(self):
+        """Release the underlying I2C file descriptor."""
+        if self._i2c is not None:
+            self._i2c.close()
+
     def display(self):
         """Write display buffer to physical display."""
         self.write_command(SSD1306_COLUMNADDR)
@@ -167,9 +172,15 @@ class SSD1306Base(object):
             # Write buffer.
             self._spi.write(self._buffer)
         else:
-            for i in range(0, len(self._buffer), 16):
-                control = 0x40   # Co = 0, DC = 0
-                self._i2c._i2c_write_i2c_block_data(self.addr, control, self._buffer[i:i+16])
+            control = 0x40   # Co = 0, DC = 0
+            # smbus2 can push the whole 1024 byte frame in a single I2C
+            # transaction; the chunked variant below is the fallback for the
+            # classic python3-smbus binding (32 byte limit per block write).
+            if getattr(self._i2c, 'has_large_block_write', False):
+                self._i2c.write_block_large(self.addr, control, self._buffer)
+            else:
+                for i in range(0, len(self._buffer), 16):
+                    self._i2c._i2c_write_i2c_block_data(self.addr, control, self._buffer[i:i+16])
 
     def image(self, image):
         """Set buffer to value of Python Imaging Library image.  The image should

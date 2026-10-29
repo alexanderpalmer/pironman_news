@@ -4,19 +4,13 @@ import time
 import threading
 import signal
 
-from gpiozero import InputDevice
-from gpiozero import DigitalOutputDevice as Fan
-
 from configparser import ConfigParser
 
-from PIL import Image,ImageDraw,ImageFont
-from oled import SSD1306_128_64
-from system_status import *
 from utils import log, run_command
 from app_info import __app_name__, __version__, username, config_file
-from ws2812_RGB import WS2812, RGB_styles
-
-from ha_api import HomeAssistantSupervisorAPI
+from system_status import (get_cpu_temperature, get_cpu_usage, get_ram_info,
+                           get_disk_info, getIP)
+from ws2812_RGB import WS2812, RGB_styles, RGB_backends
 
 # Check if the environment is Home Assistant
 # =================================================================
@@ -24,14 +18,20 @@ NORMAL = 0
 HOME_ASSISTANT_ADDON = 1
 
 mode = NORMAL
+ha = None
 
 if 'SUPERVISOR_TOKEN' in os.environ:
-    mode = HOME_ASSISTANT_ADDON
-    ha = HomeAssistantSupervisorAPI(
-        "http://supervisor/",
-        os.environ['SUPERVISOR_TOKEN']
-    )
-    log('Home Assistant Addon mode')
+    try:
+        from ha_api import HomeAssistantSupervisorAPI
+        mode = HOME_ASSISTANT_ADDON
+        ha = HomeAssistantSupervisorAPI(
+            "http://supervisor/",
+            os.environ['SUPERVISOR_TOKEN']
+        )
+        log('Home Assistant Addon mode')
+    except Exception as e:
+        log(f'Home Assistant API unavailable, running in normal mode: {e}')
+        mode = NORMAL
 
 # print info
 # =================================================================
@@ -47,7 +47,8 @@ if status == 0:
     log("\nKernel Version:", timestamp=False)
     log(f"{result}", timestamp=False)
 # OS Version
-status, result = run_command("lsb_release -a|grep Description")
+status, result = run_command(
+    ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\"")
 if status == 0:
     log("OS Version:", timestamp=False)
     log(f"{result}", timestamp=False)
@@ -59,92 +60,138 @@ if status == 0:
 
 # read config
 # =================================================================
-power_key_pin = 16
-fan_pin = 6
-rgb_pin = 10
 update_frequency = 0.5  # second
-
-temp_unit = 'C' # 'C' or 'F'
-fan_temp = 50 # celsius
-screen_always_on = False
-screen_off_time = 60
-rgb_enable = True
-rgb_style = 'breath'  # 'breath', 'leap', 'flow', 'raise_up', 'colorful', 'colorful_leap'
-rgb_color = '0a1aff'
-rgb_blink_speed = 50
-rgb_pwm_freq = 1000 # kHz
-
 temp_lower_set = 2 # celsius, lower the fan temperature setting ( fan_temp ), the fan will turn off
+POWER_KEY_HOLD_TIME = 2 # second, hold the power key this long to shut down
 
-config = ConfigParser()
-# check config_file
-if not os.path.exists(config_file):
-    log('Configuration file does not exist, recreating ...')
-    # create config_file
-    status, result = run_command(cmd=f'sudo touch {config_file}'
-        + f' && sudo chmod 774 {config_file}'
-    )
-    if status != 0:
-        log('create config_file failed:\n%s'%result)
-        raise Exception(result)
+DEFAULTS = {
+    'power_key_pin': 16,
+    'power_key_pull': 'down',
+    'fan_pin': 6,
+    'temp_unit': 'C',
+    'fan_temp': 50.0,
+    'screen_always_on': False,
+    'screen_off_time': 60,
+    'rgb_enable': True,
+    'rgb_style': 'breath',
+    'rgb_color': '0a1aff',
+    'rgb_blink_speed': 50,
+    'rgb_pwm_freq': 1000,
+    'rgb_pin': 10,
+    'rgb_backend': 'auto',
+}
 
-# read config_file
-try:
-    config.read(config_file)
-    temp_unit = config['all']['temp_unit']
-    fan_temp = float(config['all']['fan_temp'])
-    screen_always_on = config['all']['screen_always_on']
-    if screen_always_on == 'True':
-        screen_always_on = True
-    else:
-        screen_always_on = False
-    screen_off_time = int(config['all']['screen_off_time'])
-    rgb_enable = (config['all']['rgb_enable'])
-    if rgb_enable == 'False':
-        rgb_enable = False
-    else:
-        rgb_enable = True
-    rgb_style = str(config['all']['rgb_style'])
-    rgb_color = str(config['all']['rgb_color'])
-    rgb_blink_speed = int(config['all']['rgb_blink_speed'])
-    rgb_pwm_freq = int(config['all']['rgb_pwm_freq'])
-    rgb_pin = int(config['all']['rgb_pin'])
-except Exception as e:
-    log(f"read config error: {e}")
-    config['all'] ={
-                    'temp_unit':temp_unit,
-                    'fan_temp':fan_temp,
-                    'screen_always_on':screen_always_on,
-                    'screen_off_time':screen_off_time,
-                    'rgb_enable':rgb_enable,
-                    'rgb_style':rgb_style,
-                    'rgb_color':rgb_color,
-                    'rgb_blink_speed':rgb_blink_speed,
-                    'rgb_pwm_freq':rgb_pwm_freq,
-                    'rgb_pin':rgb_pin,
-                    }
-    with open(config_file, 'w') as f:
-        config.write(f)
 
-log("power_key_pin : %s"%power_key_pin)
-log("fan_pin : %s"%fan_pin)
-log("update_frequency : %s"%update_frequency)
-log("temp_unit : %s"%temp_unit)
-log("fan_temp : %s"%fan_temp)
-log("screen_always_on : %s"%screen_always_on)
-log("screen_off_time : %s"%screen_off_time)
-log("rgb_enable : %s"%rgb_enable)
-log("rgb_style : %s"%rgb_style)
-log("rgb_color : %s"%rgb_color)
-log("rgb_blink_speed : %s"%rgb_blink_speed)
-log("rgb_pwm_freq : %s"%rgb_pwm_freq)
-log("rgb_pin : %s"%rgb_pin)
+def _as_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'on', 'yes')
+
+
+def read_config():
+    '''
+    Read the config file, falling back to the default for every single key.
+
+    Up to 2.2.9 one missing or malformed key raised an exception that made
+    the whole file be overwritten with defaults, so adding a new option
+    silently wiped every setting the user had made. Now only the missing
+    keys are appended.
+    '''
+    config = ConfigParser()
+    values = dict(DEFAULTS)
+
+    if not os.path.exists(config_file):
+        log('Configuration file does not exist, recreating ...')
+        try:
+            os.makedirs(os.path.dirname(config_file), exist_ok=True)
+        except OSError as e:
+            log(f'cannot create config directory: {e}')
+
+    try:
+        config.read(config_file)
+    except Exception as e:
+        log(f'config file unreadable, using defaults: {e}')
+
+    section = config['all'] if config.has_section('all') else {}
+    missing = []
+    casts = {
+        'power_key_pin': int, 'fan_pin': int, 'fan_temp': float,
+        'screen_off_time': int, 'rgb_blink_speed': int,
+        'rgb_pwm_freq': int, 'rgb_pin': int,
+        'screen_always_on': lambda v: _as_bool(v, False),
+        'rgb_enable': lambda v: _as_bool(v, True),
+    }
+    for key, default in DEFAULTS.items():
+        if key not in section:
+            missing.append(key)
+            continue
+        raw = section[key]
+        try:
+            values[key] = casts.get(key, str)(raw)
+            if isinstance(values[key], str):
+                values[key] = values[key].strip()
+        except Exception as e:
+            log(f'config key {key}={raw!r} invalid ({e}), using {default!r}')
+
+    # validate the values that can break hardware access
+    if values['rgb_style'] not in RGB_styles:
+        log(f"rgb_style {values['rgb_style']!r} unknown, using 'breath'")
+        values['rgb_style'] = 'breath'
+    if values['rgb_backend'] not in RGB_backends:
+        log(f"rgb_backend {values['rgb_backend']!r} unknown, using 'auto'")
+        values['rgb_backend'] = 'auto'
+    if values['temp_unit'] not in ('C', 'F'):
+        log(f"temp_unit {values['temp_unit']!r} unknown, using 'C'")
+        values['temp_unit'] = 'C'
+    if not 30 <= values['fan_temp'] <= 80:
+        log(f"fan_temp {values['fan_temp']} out of range (30~80), using 50")
+        values['fan_temp'] = 50.0
+
+    if missing:
+        log(f'adding missing config keys: {", ".join(missing)}')
+        if not config.has_section('all'):
+            config.add_section('all')
+        for key in missing:
+            config['all'][key] = str(DEFAULTS[key])
+        try:
+            with open(config_file, 'w') as f:
+                config.write(f)
+        except OSError as e:
+            log(f'cannot write config file: {e}')
+
+    return values
+
+
+cfg = read_config()
+
+power_key_pin = cfg['power_key_pin']
+power_key_pull = cfg['power_key_pull']
+fan_pin = cfg['fan_pin']
+temp_unit = cfg['temp_unit']
+fan_temp = cfg['fan_temp']
+screen_always_on = cfg['screen_always_on']
+screen_off_time = cfg['screen_off_time']
+rgb_enable = cfg['rgb_enable']
+rgb_style = cfg['rgb_style']
+rgb_color = cfg['rgb_color']
+rgb_blink_speed = cfg['rgb_blink_speed']
+rgb_pwm_freq = cfg['rgb_pwm_freq']
+rgb_pin = cfg['rgb_pin']
+rgb_backend = cfg['rgb_backend']
+
+for key in ('power_key_pin', 'power_key_pull', 'fan_pin', 'temp_unit',
+            'fan_temp', 'screen_always_on', 'screen_off_time', 'rgb_enable',
+            'rgb_style', 'rgb_color', 'rgb_blink_speed', 'rgb_pwm_freq',
+            'rgb_pin', 'rgb_backend'):
+    log('%s : %s' % (key, cfg[key]))
+log('update_frequency : %s' % update_frequency)
 log(">>>", timestamp=False)
 
 # rgb_strip init
 # =================================================================
 try:
-    strip = WS2812(LED_COUNT=16, LED_PIN=rgb_pin, LED_FREQ_HZ=rgb_pwm_freq*1000)
+    strip = WS2812(LED_COUNT=16, LED_PIN=rgb_pin,
+                   LED_FREQ_HZ=rgb_pwm_freq*1000, LED_BACKEND=rgb_backend)
     log('rgb_strip init success')
 except Exception as e:
     log('rgb_strip init failed:\n%s'%e)
@@ -166,16 +213,23 @@ if 'close_rgb' in sys.argv:
     log('close_rgb in sys.argv')
     if strip != None:
         log('rgb_strip clear')
-        strip.clear()
+        strip.close()
     sys.exit(0)
 
 # oled init
 # =================================================================
 oled_ok = False
 oled_stat = False
+oled = None
+draw = None
+image = None
+font_8 = font_12 = None
+width = height = 0
 
 try:
-    run_command("sudo modprobe i2c-dev")
+    from PIL import Image, ImageDraw, ImageFont
+    from oled import SSD1306_128_64
+
     oled = SSD1306_128_64()
     width = oled.width
     height = oled.height
@@ -185,12 +239,10 @@ try:
 
     image = Image.new('1', (width, height))
     draw = ImageDraw.Draw(image)
-    font_8 = ImageFont.truetype('/opt/%s/Minecraftia-Regular.ttf'%__app_name__, 8)
-    font_12 = ImageFont.truetype('/opt/%s/Minecraftia-Regular.ttf'%__app_name__, 12)
-
-    def draw_text(text,x,y,fill=1):
-        text = str(text)
-        draw.text((x, y), text=text, font=font_8, fill=fill)
+    _font = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'Minecraftia-Regular.ttf')
+    font_8 = ImageFont.truetype(_font, 8)
+    font_12 = ImageFont.truetype(_font, 12)
 
     oled_ok = True
     oled_stat = True
@@ -199,12 +251,34 @@ except Exception as e:
     log('oled init failed:\n%s'%e)
     oled_ok = False
     oled_stat = False
+    oled = None
+
+
+def draw_text(text, x, y, fill=1):
+    draw.text((x, y), text=str(text), font=font_8, fill=fill)
+
+
+def oled_on():
+    '''Switch the panel on, ignoring the call when there is no panel.'''
+    global oled_stat
+    if oled_ok:
+        oled.on()
+        oled_stat = True
+
+
+def oled_off():
+    global oled_stat
+    if oled_ok:
+        oled.off()
+        oled_stat = False
 
 
 # fan io  init
 # =================================================================
 fan_ok = False
+fan = None
 try:
+    from gpiozero import DigitalOutputDevice as Fan
     fan = Fan(fan_pin)
     fan_ok = True
     log('fan init success')
@@ -216,11 +290,23 @@ except Exception as e:
 # powerkey io init
 # =================================================================
 power_key_ok = False
+power_key = None
 
 try:
-    power_key = InputDevice(power_key_pin, pull_up=False)
+    from gpiozero import InputDevice
+    # pull_up=False keeps the fix from 2.2.9: gpiozero's Button uses edge
+    # callbacks, which stopped working on kernel 6.6 and later, so the pin
+    # is polled instead. The pull direction is configurable because it
+    # depends on the Pironman board revision.
+    _pull = {'down': False, 'up': True, 'none': None}.get(
+        str(power_key_pull).strip().lower(), False)
+    if _pull is None:
+        power_key = InputDevice(power_key_pin, pull_up=None, active_state=True)
+    else:
+        power_key = InputDevice(power_key_pin, pull_up=_pull)
     power_key_ok = True
-    log('power_key init success')
+    log(f'power_key init success (pull={power_key_pull}, '
+        f'idle value={power_key.value})')
 except Exception as e:
     power_key_ok = False
     log(f'power_key init failed:\n {e}')
@@ -230,53 +316,66 @@ except Exception as e:
 # =================================================================
 def getIPAddress():
     ip = None
-    if mode == NORMAL:
+    IPs = {}
+    if mode == HOME_ASSISTANT_ADDON:
+        try:
+            IPs = ha.get_ip() or {}
+        except Exception as e:
+            log(f'home assistant ip lookup failed: {e}')
+    if not IPs:
         IPs = getIP()
-    elif mode == HOME_ASSISTANT_ADDON:
-        IPs = ha.get_ip()
-        if len(IPs) == 0:
-            IPs = getIP()
-    # log("Got IPs: %s" %IPs)
-    if 'wlan0' in IPs and IPs['wlan0'] != None and IPs['wlan0'] != '':
+    if 'wlan0' in IPs and IPs['wlan0']:
         ip = IPs['wlan0']
-    elif 'eth0' in IPs and IPs['eth0'] != None and IPs['eth0'] != '':
+    elif 'eth0' in IPs and IPs['eth0']:
         ip = IPs['eth0']
-    elif len(IPs.keys()) > 0:
-        interface = list(IPs.keys())[0]
-        if IPs[interface] != None and IPs[interface] != '':
-            ip = IPs[list(IPs.keys())[0]]
-        else:
-            ip = 'DISCONNECT'
     else:
-        ip = 'DISCONNECT'
-
-    return ip
+        for interface in IPs:
+            if IPs[interface]:
+                ip = IPs[interface]
+                break
+    return ip or 'DISCONNECT'
 
 # exit handler
 # =================================================================
-def exit_handler():
-    try:
-        # clear power key
-        power_key.close()
-        # oled off
-        if oled_ok:
-            oled.off()
+_exiting = threading.Event()
 
-        # fan off
-        fan.off()
-        fan.close() # release gpio resource
-        # rgb off
-        if strip != None:
-            strip.clear()
-            time.sleep(0.2)
-        sys.exit(0)
-    except:
-        pass
+def exit_handler():
+    '''
+    Release every resource independently.
+
+    Up to 2.2.9 all of this sat in one try/except, so a missing power key
+    raised a NameError on the very first line and the panel, the fan and
+    the LEDs were never shut down.
+    '''
+    if _exiting.is_set():
+        return
+    _exiting.set()
+    # stop the animation thread first, otherwise it keeps writing to the
+    # strip while we are trying to clear it
+    if strip is not None:
+        try:
+            strip.stop()
+        except Exception as e:
+            log(f'exit: strip.stop failed: {e}')
+    for what, device, action in (
+        ('power_key', power_key, lambda: power_key.close()),
+        ('oled', oled, lambda: (oled.off(), oled.close())),
+        ('fan', fan, lambda: (fan.off(), fan.close())),
+        ('rgb', strip, lambda: strip.close()),
+    ):
+        if device is None:
+            continue
+        try:
+            action()
+        except Exception as e:
+            log(f'exit: {what} cleanup failed: {e}')
+    log('cleanup done')
 
 def signal_handler(signo, frame):
     if signo == signal.SIGTERM or signo == signal.SIGINT:
         log("Received SIGTERM or SIGINT signal. Cleaning up...")
         exit_handler()
+        sys.exit(0)
 
 # Register signal handlers
 signal.signal(signal.SIGTERM, signal_handler)
@@ -288,12 +387,17 @@ def main():
     global fan_temp, power_key_pin, screen_off_time, rgb_color, rgb_pin
     global oled_stat, screen_always_on
 
-    ip = 'DISCONNECT'
-    last_ip = 'DISCONNECT'
+    last_ip = None
 
     time_start = time.time()
     power_key_flag = False
     power_timer = 0
+
+    # without a power key there is no way to wake the panel again,
+    # so keep it on permanently
+    if not power_key_ok and oled_ok:
+        log('no power key, keeping the screen on')
+        screen_always_on = True
 
     # ---- rgb_thread start ----
     if strip != None:
@@ -306,30 +410,22 @@ def main():
 
 
     # ---- main loop ----
-    while True:
+    while not _exiting.is_set():
 
         # ---- get CPU temperature ----
         CPU_temp_C = float(get_cpu_temperature()) # celcius
         CPU_temp_F = float(CPU_temp_C * 1.8 + 32) # fahrenheit
 
         # ---- fan control ----
+        # fan_temp is always in celsius (as documented in config.txt);
+        # temp_unit only selects the unit shown on the panel. Before 2.3.0
+        # the threshold was compared against the fahrenheit value too, so
+        # "pironman -u F" made the fan run non-stop.
         if fan_ok:
-            if temp_unit == 'C':
-                if CPU_temp_C > fan_temp:
-                    fan.on()
-                elif CPU_temp_C < fan_temp - temp_lower_set:
-                    fan.off()
-            elif temp_unit == 'F':
-                if CPU_temp_F > fan_temp:
-                    fan.on()
-                elif CPU_temp_F < fan_temp - temp_lower_set*1.8:
-                    fan.off()
-            else:
-                log('temp_unit error, use defalut value: 50\'C')
-                if CPU_temp_C > 50:
-                    fan.on()
-                elif CPU_temp_C < 40:
-                    fan.off()
+            if CPU_temp_C > fan_temp:
+                fan.on()
+            elif CPU_temp_C < fan_temp - temp_lower_set:
+                fan.off()
 
         # ---- oled control ----
         if oled_ok and oled_stat == True:
@@ -410,56 +506,57 @@ def main():
             draw.pieslice((ip_rect.x-25,ip_rect.y,ip_rect.x-3,ip_rect.height+10), start=270, end=0, fill=0, outline=0)
             draw_text(ip,*ip_rect.coord(),0)
             # draw the image buffer.
-            oled.image(image)
-            oled.display()
+            try:
+                oled.image(image)
+                oled.display()
+            except OSError as e:
+                # a single I2C glitch must not take the service down
+                log(f'oled write failed: {e}')
 
             # screen off timer
             if screen_always_on == False and (time.time()-time_start) > screen_off_time:
-                oled.off()
-                oled_stat = False
+                oled_off()
 
         # ---- power key event ----
-        if power_key_ok != True:
-            screen_always_on = True
-            oled.on()
-        else:
+        if power_key_ok:
             if power_key.value == 0:
                 # screen on
                 if oled_ok and oled_stat == False:
-                    oled.on()
-                    oled_stat = True
+                    oled_on()
                     time_start = time.time()
                 # power off
                 if power_key_flag == False:
                     power_key_flag = True
                     power_timer = time.time()
-                elif (time.time()-power_timer) > 2:
+                elif (time.time()-power_timer) > POWER_KEY_HOLD_TIME:
                     #
                     if oled_ok:
-                        oled.on()
+                        oled_on()
                         draw.rectangle((0,0,width,height), outline=0, fill=0)
-                        # draw_text('POWER OFF',36,24)
                         left, top, right, bottom = font_12.getbbox('POWER OFF')
                         text_width = right - left
                         text_height = bottom - top
                         text_x = int((width - text_width)/2-1)
                         text_y = int((height - text_height)/2-1)
                         draw.text((text_x, text_y), text='POWER OFF', font=font_12, fill=1)
-                        oled.image(image)
-                        oled.display()
-                    #
+                        try:
+                            oled.image(image)
+                            oled.display()
+                        except OSError as e:
+                            log(f'oled write failed: {e}')
+                    # wait for the key to be released; sleep instead of
+                    # spinning, the old busy loop pegged a core at 100%
                     while power_key.value == 0:
-                        pass
+                        time.sleep(0.05)
                     log("POWER OFF")
                     #
-                    if oled_ok:
-                        oled_stat = False
-                        oled.off()
+                    oled_off()
                     if mode == HOME_ASSISTANT_ADDON:
                         ha.shutdown() # shutdown homeassistant host
                     else:
+                        exit_handler()
                         os.system('poweroff')
-                        sys.exit(1)
+                    return
             else:
                 power_key_flag = False
 
@@ -484,9 +581,10 @@ class Rect:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
-        log(f'error\n {e}')
+        import traceback
+        log(f'error\n {traceback.format_exc()}')
     finally:
         exit_handler()
-
-

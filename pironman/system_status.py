@@ -1,21 +1,42 @@
 import os
-import subprocess
+import socket
 import shutil
 import psutil
 
+# Keys psutil may use for the SoC sensor, newest kernels first.
+CPU_TEMP_KEYS = ('cpu_thermal', 'coretemp', 'soc_thermal', 'bcm2835_thermal')
+THERMAL_ZONE = '/sys/class/thermal/thermal_zone0/temp'
+
+
 def get_cpu_temperature():
     '''
-    Return CPU temperature as a character string
+    Return the CPU temperature in degrees celsius.
+
+    psutil is tried first, then the thermal zone in sysfs, which exists on
+    every Raspberry Pi kernel and needs no library at all. Returning 0.0 on
+    failure keeps the fan logic running instead of crashing the service.
     '''
-    return psutil.sensors_temperatures()['cpu_thermal'][0].current
+    try:
+        temps = psutil.sensors_temperatures()
+        for key in CPU_TEMP_KEYS:
+            if key in temps and temps[key]:
+                return temps[key][0].current
+        # unknown key name: take whatever the first sensor reports
+        for entries in temps.values():
+            if entries:
+                return entries[0].current
+    except Exception:
+        pass
+    try:
+        with open(THERMAL_ZONE) as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return 0.0
 
 
 def get_ram_info():
     '''
-    Return RAM information (unit=kb) in a list
-    Index 0: total RAM
-    Index 1: used RAM
-    Index 2: free RAM
+    Return RAM information in GiB plus the used percentage.
     '''
     memory_info = psutil.virtual_memory()
     memory = {
@@ -43,20 +64,32 @@ def get_disk_info():
 
 # IP address
 def getIP():
+    '''
+    Return {interface: IPv4 address} for every up, non-loopback interface.
+
+    Read straight from psutil instead of shelling out to "ifconfig": that
+    binary comes from net-tools, which is deprecated and not installed by
+    default on Debian trixie, and its output is locale dependent. Virtual
+    bridges created by docker/libvirt are skipped so the OLED keeps showing
+    the address of the real network interface.
+    '''
+    skip_prefixes = ('lo', 'docker', 'br-', 'veth', 'virbr', 'tailscale',
+                     'zt', 'cni', 'flannel')
     IPs = {}
-    NIC_devices = []
-    NIC_devices = os.listdir('/sys/class/net/')
-    # print(NIC_devices)
-
-    for NIC in NIC_devices:
-        if NIC == 'lo':
+    try:
+        addrs = psutil.net_if_addrs()
+        stats = psutil.net_if_stats()
+    except Exception:
+        return IPs
+    for nic, addresses in addrs.items():
+        if nic.startswith(skip_prefixes):
             continue
-        try:
-            IPs[NIC] = subprocess.check_output('ifconfig ' + NIC + ' | grep "inet " | awk \'{print $2}\'', shell=True).decode().strip('\n')
-        except:
+        if nic in stats and not stats[nic].isup:
             continue
-        # print(NIC, IPs[NIC])
-
+        for addr in addresses:
+            if addr.family == socket.AF_INET and addr.address:
+                IPs[nic] = addr.address
+                break
     return IPs
 
 def getMAC():
@@ -83,7 +116,6 @@ if __name__ == '__main__':
     cpu_temp = get_cpu_temperature()
     cpu_usage = get_cpu_usage()
     # RAM information
-    # Output is in kb, here I convert it in Mb for readability
     ram_info = get_ram_info()
     ram_total = ram_info['total']
     ram_used = ram_info['used']
@@ -113,9 +145,7 @@ if __name__ == '__main__':
     print(f'DISK Used Space = {disk_used} GB')
     print(f'DISK Used Percentage = {disk_percent} %')
     print('')
+    print('all IPs : %s'%IPs)
     print('wlan0 : %s'%wlan0)
     print('eth0 : %s'%eth0)
     print('')
-
-
-

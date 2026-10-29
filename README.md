@@ -26,11 +26,10 @@ The pironman is used on Raspberry Pi to control OLED to display system status in
 <a id="update"></a>
 
 ## Install
-- For systems that don't have git, python3 and pip pre-installed you need to install them first
+- For systems that don't have git and python3 pre-installed you need to install them first
   ```bash
   sudo apt-get update
-  sudo apt-get install git -y
-  sudo apt-get install python3 python3-pip python3-setuptools -y
+  sudo apt-get install git python3 -y
   ```
 - Execute the installation script
   ```bash
@@ -39,6 +38,15 @@ The pironman is used on Raspberry Pi to control OLED to display system status in
   cd ~/pironman
   sudo python3 install.py
   ```
+- Reboot when the installer asks for it. I2C and SPI are switched on in
+  `/boot/firmware/config.txt`, and those only take effect after a restart.
+
+All dependencies come from apt, so no compiler is needed. Only driving the
+strip from the PWM (GPIO12) or PCM (GPIO21) pin requires the `rpi-ws281x`
+library, which is built on request:
+```bash
+sudo python3 install.py --with-ws281x
+```
 
 ## Usage
 ```bash
@@ -49,28 +57,35 @@ Options:
   start            start pironman service
   stop             stop pironman service
   restart          restart pironman service
+  status           show service status
+  log              follow the service log
   -h,--help        help, show this help
   -c,--check       show all configurations
   -a,--auto        [ on ],enable auto-start at boot
                    [ off ], disable auto-start at boot
-  -u,--unit        [ C/F ], set the unit of temperature,
-                       C or F (Celsius/Fahrenheit)
+  -u,--unit        [ C/F ], unit of the temperature shown on the screen,
+                   C or F (Celsius/Fahrenheit). The fan threshold stays
+                   in celsius.
   -f,--fan         [ temp ], Temperature at which the fan switches on,
                    in celsius (default 50),in range (30 ~ 80)
   -al,--always_on  [on/true/off/false], whether the screen is always on,
                    default False
   -s,--staty_time  [time], screen display duration in second,
-                   in second, default 30
+                   in second, default 60
   -re,--rgb-enable [on/true/off/false], rgb strip enable
   -rw,--rgb_sw     [on/true/off/false], rgb strip switch
   -rs,--rgb_style  rgb strip display style, default: breath,
-                   in [breath / leap / flow / raise_up / colorful]
+                   in [breath / static / leap / flow / raise_up /
+                   colorful / colorful_static / colorful_leap]
   -rc,--rgb_color  [(HEX)color], set the color of rgb strip,
                    default: 0a1aff
   -rb,--rgb_speed  [speed], rgb blink speed (0 ~ 100, default 50)
-  -pwm,--rgb_pwm   [frequency], rgb signal frequency (400 ~ 1600, default 1000 kHz)
+  -pwm,--rgb_pwm   [frequency], rgb signal frequency (400 ~ 1600, default
+                   1000 kHz), only used by the ws281x backend
   -rp,--rgb_pin    [pin], rgb signal pin, could be [10 / spi/ SPI / 12 / pwm/ PWM] or
                    [21 / pcm / PCM], default 10
+  -bk,--rgb_backend [auto/spi/ws281x], how the WS2812 signal is generated,
+                   default auto
   -F,--foreground  run in foreground
 
 ```
@@ -83,6 +98,8 @@ Systems that passed the test on the Raspberry Pi 4B:
 <!-- https://apps.timwhitlock.info/emoji/tables/unicode#block-6c-other-additional-symbols -->
   | system |   is compatible ? |
   | :---   | :---:   |
+  | Raspberry Pi OS - Trixie (64 bit), kernel 6.6 ... 6.18 | &#x2705; (since 2.3.0) |
+  | Raspberry Pi OS - Bookworm (32/64 bit) | &#x2705; |
   | Raspberry Pi OS - Bullseye (32/64 bit) | &#x2705; |
   | Raspberry Pi OS lite - Bullseye (32/64 bit) | &#x2705; |
   | Raspberry Pi OS - Buster (32 bit) | &#x2705; |
@@ -97,6 +114,47 @@ Systems that passed the test on the Raspberry Pi 4B:
   | LibreELEC | &#x274C; |
   | <a href="https://pironman-v2.readthedocs.io/en/latest/home_assistant.html">HassOS</a> | &#x2705; |
 </font>
+
+## How the RGB strip is driven
+
+The WS2812 strip needs a tightly timed 800 kHz signal. There are two ways
+to produce it, selected with `rgb_backend`:
+
+- **`spi`** (default on GPIO10) bit-bangs the waveform through the kernel
+  SPI driver: every LED bit becomes three SPI bits at 2.4 MHz, so a `0` is
+  `100` and a `1` is `110`. It only needs `python3-spidev`, works on any
+  kernel and does not touch `/dev/mem`. `core_freq=500` and
+  `core_freq_min=500` are set in the boot config because the Pi 4 derives
+  the SPI clock from the GPU core clock, which would otherwise drop to
+  200 MHz when idle and distort the timing.
+- **`ws281x`** uses the `rpi-ws281x` C library and is required for GPIO12
+  (PWM) and GPIO21 (PCM). It maps `/dev/mem`, claims a DMA channel and has
+  to be compiled, so install it with `sudo python3 install.py --with-ws281x`.
+
+## Troubleshooting
+
+```bash
+sudo pironman status      # is the service running?
+sudo pironman log         # live log
+sudo pironman -c          # current configuration
+```
+
+- **Screen stays dark.** The log says which bus it tried. Check that I2C is
+  on (`ls /dev/i2c-1`) and that the panel answers:
+  `sudo i2cdetect -y 1` should show a device at `3c`.
+- **LEDs stay dark.** Check that SPI is on (`ls /dev/spidev0.0`). If
+  `rgb_pin` is 12 or 21 the `rpi-ws281x` library has to be installed.
+- **Nothing happens at all after an upgrade.** I2C and SPI only come up
+  after a reboot.
+- **The power key seems stuck.** The log prints the idle level at startup
+  (`power_key init success (pull=down, idle value=1)`). It has to read `1`
+  while the key is not pressed; if it reads `0`, set
+  `power_key_pull = up` in `/opt/pironman/config.txt`.
+- **Running from a checkout** without disturbing the installed copy:
+  ```bash
+  sudo PIRONMAN_CONFIG=/tmp/pironman.conf PIRONMAN_LOG=/tmp/pironman.log \
+       python3 pironman/main.py
+  ```
 
 <a id="about_sunfounder"></a>
 ## About SunFounder

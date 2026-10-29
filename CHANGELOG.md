@@ -1,5 +1,102 @@
 # Change Log
 
+## [2.3.0] - 2026-10-29
+
+Port to Debian 13 "trixie" / kernel 6.6+ / Python 3.13. The 2.2.9 version
+no longer installs or runs on trixie.
+
+### Fixed
+
+- Installation aborted on trixie: `libfreetype6-dev` does not exist there
+  any more (it is `libfreetype-dev`), so `apt install` failed
+- Installation fought PEP 668: `/usr` is marked EXTERNALLY-MANAGED, so
+  `pip3 install pillow/psutil/requests` either refused to run or shadowed
+  the distribution packages. All runtime dependencies are now installed
+  from apt (`python3-pil`, `python3-psutil`, `python3-requests`,
+  `python3-smbus2`, `python3-spidev`, `python3-lgpio`) and no compiler is
+  needed for the default setup
+- `rpi-ws281x` is no longer required: the LED strip on the default pin
+  GPIO10 is driven through the kernel SPI driver (see "Added"). The library
+  is still used for the PWM (12) and PCM (21) pins and can be built with
+  `sudo python3 install.py --with-ws281x`
+- `run_command()` read the exit status with `Popen.poll()` without waiting,
+  which returns `None` instead of a code, so every `if status == 0` check
+  silently failed and the kernel/OS/PCB information never reached the log
+- The systemd unit had a trailing comment on the `After=` line. systemd
+  does not allow that and parsed the words of the comment as unit names
+- The unit used `Type=forking` around a shell script that backgrounded
+  python with `&`, so systemd never learned the real PID and could not
+  stop or restart the service reliably. It is now `Type=simple` and runs
+  `main.py` directly, so `systemctl stop` performs a clean shutdown
+- `pironman log` showed nothing while the service was running: journald is
+  a pipe and not a terminal, so python block-buffered stdout and the log
+  lines only reached the journal when the process exited. The unit now sets
+  `Environment=PYTHONUNBUFFERED=1`
+- `pironman stop` built its kill list with `ps aux | grep $main | awk
+  '{print $2}'`, which also matched the `grep` itself and any unrelated
+  process whose command line contained the path
+- The exit handler did all its work in a single `try`/`except`: when no
+  power key was present the very first line raised `NameError` and the
+  screen, the fan and the LEDs were never switched off. Every resource is
+  now released on its own
+- Several crashes when hardware is missing: `oled.on()` was called even
+  though OLED initialization had failed
+- `pironman -u F` made the fan run non-stop, because the celsius threshold
+  `fan_temp` was compared against the fahrenheit reading. `temp_unit` now
+  only selects the unit shown on the screen
+- A missing or new config key made the whole config file be overwritten
+  with defaults, wiping every user setting. Missing keys are now appended
+  individually
+- `Config.set()` in `install.py` matched keys as a plain substring over the
+  whole file, so setting `core_freq` could destroy an existing
+  `core_freq_min` line, and keys inside `[pi5]`/`[cm4]` blocks could be
+  rewritten although they do not apply to this board
+- `Config.remove()` deleted items from the list it was iterating over
+- The IP address was read by parsing `ifconfig` output. net-tools is
+  deprecated and not installed by default on trixie, and the output is
+  locale dependent; psutil is used instead
+- The CPU temperature came from a single hard coded psutil sensor key; it
+  now falls back through the known key names to the sysfs thermal zone
+- Waiting for the power key to be released was a busy loop that pegged a
+  CPU core at 100%
+- The RGB animation thread kept writing to the strip while the shutdown
+  code was clearing it; the thread is now stopped first and reacts
+  immediately
+- The service unit was installed to `/usr/lib/systemd/system`, which
+  belongs to .deb packages and is overwritten by distribution upgrades. It
+  now goes to `/etc/systemd/system`, and a unit left there by 2.2.x is
+  removed
+- Reinstalling overwrote `/opt/pironman/config.txt` and truncated the log
+
+### Added
+
+- `rgb_backend` option (`auto` / `spi` / `ws281x`). The new `spi` backend
+  clocks the WS2812 protocol out through the kernel SPI driver on GPIO10,
+  encoding each LED bit as three SPI bits at 2.4 MHz. It needs no compiler,
+  no `/dev/mem` and no DMA channel, which is what makes the strip work on
+  current kernels
+- `power_key_pin`, `power_key_pull` and `fan_pin` are configurable
+- `pironman status` and `pironman log` subcommands
+- `install.py --with-ws281x` to build the library for the PWM/PCM pins
+- Range and value checks for `rgb_color`, `fan_temp`, `rgb_style`,
+  `rgb_backend` and `temp_unit`
+- Clear, actionable messages when I2C or SPI is not enabled in
+  `/boot/firmware/config.txt`
+- `install.py` backs up the boot config to `config.txt.pironman-bak`
+- Log rotation at 1 MiB
+- `PIRONMAN_CONFIG` / `PIRONMAN_LOG` environment overrides, so the program
+  can be run from a checkout without touching the installed copy
+
+### Changed
+
+- The OLED frame is sent in a single I2C transaction via smbus2 instead of
+  64 block writes
+- The I2C bus is detected at runtime instead of being hard coded to bus 1,
+  and the HDMI buses (20/21) are ignored
+- `i2c.scan()` probes the bus directly instead of parsing `i2cdetect` output
+- Startup logs the power key idle level, which makes a wrong
+  `power_key_pull` setting obvious
+
 ## [2.2.9] - 2024-7-23
 
 ### Fixed
