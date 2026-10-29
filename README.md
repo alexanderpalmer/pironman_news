@@ -1,6 +1,11 @@
 # SunFounder Pironman for Raspberry Pi
 This repository is for SunFounder Pironman - A PC case for Raspberry Pi. you can buy it on [our website](https://www.sunfounder.com/products/raspberry-pi-4-case), or search sunfounder in Amazon.
 
+> This is a fork of [sunfounder/pironman](https://github.com/sunfounder/pironman)
+> carrying the 2.3.0 port to Debian 13 "trixie" / kernel 6.6+ / Python 3.13.
+> Upstream 2.2.9 no longer installs or runs there, so install from this
+> repository, not from upstream.
+
 Quick Links:
 
 - [SunFounder Pironman for Raspberry Pi](#sunfounder-pironman-for-raspberry-pi)
@@ -34,8 +39,8 @@ The pironman is used on Raspberry Pi to control OLED to display system status in
 - Execute the installation script
   ```bash
   cd ~
-  git clone -b v2.0 https://github.com/sunfounder/pironman.git
-  cd ~/pironman
+  git clone https://github.com/alexanderpalmer/pironman_news.git
+  cd ~/pironman_news
   sudo python3 install.py
   ```
 - Reboot when the installer asks for it. I2C and SPI are switched on in
@@ -90,7 +95,7 @@ Options:
 
 ```
 ## Update
-https://github.com/sunfounder/pironman/blob/master/CHANGELOG.md
+https://github.com/alexanderpalmer/pironman_news/blob/main/CHANGELOG.md
 
 ## Compatible Systems
 Systems that passed the test on the Raspberry Pi 4B:
